@@ -93,6 +93,20 @@ const MemorySchema = z
   .strict()
   .optional();
 
+const QuarantineSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    dbPath: z.string().min(1).optional(),
+    token: z.string().min(1).optional().register(sensitive),
+    path: z.string().optional(),
+    maxBodyBytes: z.number().int().positive().optional(),
+    maxPendingItems: z.number().int().positive().optional(),
+    maxContentBytes: z.number().int().positive().optional(),
+    purgeAfterDays: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
 const HttpUrlSchema = z
   .string()
   .url()
@@ -560,6 +574,7 @@ export const OpenClawSchema = z
       .strict()
       .optional(),
     memory: MemorySchema,
+    quarantine: QuarantineSchema,
     skills: z
       .object({
         allowBundled: z.array(z.string()).optional(),
