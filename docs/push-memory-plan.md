@@ -2,107 +2,190 @@
 
 ## Problem
 
-The current memory model is pull-based. To give the bot context about flights, hotels, etc.,
-you'd need to grant it credentials to external services. That's a security risk.
+The bot needs context about your flights, hotels, packages — but granting it credentials
+to Delta, Hilton, FedEx is a safety risk. Even if the bot is trustworthy today, credential
+scope creep is how breaches happen.
 
-**Push model**: Lightweight pushers that *you* control push structured data into the bot's
-memory. The bot never gets credentials to Delta, Hilton, FedEx, etc.
+## Safety Model
 
-**Enrichment model**: Pushed data contains private identifiers (confirmation codes, seat
-assignments, room numbers). The bot can independently look up *public* information (flight
-status, gate changes, delays) using identifiers from the pushed data, via `web_fetch` or
-dedicated enrichment URLs. Private data stays private; public data stays fresh.
+The system is built around a single invariant: **the bot never holds credentials to any
+external service**. Everything flows from this.
+
+Three access tiers enforce the boundary:
+
+### Tier 0 — Cached (instant, no network, always safe)
+
+The bot reads structured data that was previously pushed into its local store.
+
+- Confirmation codes, seat assignments, room numbers, tracking numbers
+- These don't change often — reading from cache is correct
+- No network call, no approval needed
+
+*"What's my confirmation code?" → reads `data.confirmationCode` from local SQLite*
+
+### Tier 1 — Public Enrichment (bot fetches freely, no approval)
+
+The bot uses its existing `web_fetch` tool on public URLs. The push entry tells it
+*where* to look; the bot does the fetching. No credentials needed.
+
+- Flight status on FlightAware (public)
+- Package tracking on carrier websites (public with tracking number)
+- Gate changes, delays, delivery updates
+
+*"Is my flight on time?" → `web_fetch` on FlightAware URL from push entry*
+
+### Tier 2 — Private Refresh (user approves on the push service)
+
+When pushed data is stale and the bot needs fresh private info, it **surfaces a refresh
+URL** to the user. The user clicks the link, which opens the push service's UI. The user
+approves the refresh there. The push service fetches from Delta, pushes fresh data back.
+
+**The bot never calls the push service directly.** It just hands the user a link.
+
+```
+Bot: "Your flight data was last updated 3 days ago."
+Bot: "Refresh → https://my-flights.example.com/refresh/DL1234-2026-02-19"
+
+User clicks → push service UI → user approves →
+push service talks to Delta → pushes fresh data to bot →
+bot sees updated entry
+
+Bot: "Got the update — seat still 12A, gate changed to B42."
+```
+
+The approval happens entirely on the push service side, in the user's browser/app.
+The bot is just a messenger that knows how to construct the refresh URL.
+
+## Why This Is Safe
+
+| Action | Who holds credentials? | Who approves? |
+|--------|----------------------|---------------|
+| Read cached data | Nobody (local read) | Nobody needed |
+| Fetch public status | Nobody (public URL) | Nobody needed |
+| Refresh private data | Push service | User (on push service UI) |
+| Push new data to bot | Push service | Push service (automated) |
+
+The bot never touches Delta, Hilton, FedEx, or the push service's refresh endpoint.
+At worst, a compromised bot leaks data it already has cached. It can't escalate to
+fetching new private data or acting on your accounts.
 
 ## Architecture
 
 ```
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│  Flight Pusher   │  │  Hotel Pusher    │  │ Package Pusher   │
-│  (Delta creds)   │  │  (Hilton creds)  │  │  (FedEx creds)   │
-└────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
-         │                     │                      │
-         └─────────┬───────────┘──────────────────────┘
-                   │
-           POST /v1/memory/push
-           (Bearer: hooks-token)
-                   │
-                   ▼
-    ┌──────────────────────────────┐
-    │     Push Memory Handler      │
-    │                              │
-    │  1. Auth (hooks token)       │
-    │  2. Validate schema (Zod)    │
-    │  3. Store structured JSON    │
-    │  4. Generate searchable .md  │
-    │  5. Trigger memory sync      │
-    │  6. Fire webhooks            │
-    └──────────────┬───────────────┘
-                   │
-          ┌────────┴─────────┐
-          ▼                  ▼
-   ┌──────────────┐   ┌──────────────────┐
-   │  SQLite DB   │   │ Memory Files     │
-   │  push_entries│   │ ~/.openclaw/     │
-   │              │   │  memory/push/    │
-   │ Structured   │   │  {source}/       │
-   │ JSON fields  │   │  {key}.md        │
-   │ + metadata   │   │                  │
-   └──────────────┘   └──────────────────┘
-          │                  │
-          └────────┬─────────┘
-                   ▼
-          ┌────────────────────┐
-          │    Agent Tools     │
-          │                    │
-          │ memory_search      │ ← semantic queries (existing)
-          │ memory_push_lookup │ ← structured lookups (new)
-          │ web_fetch          │ ← public enrichment (existing)
-          └────────────────────┘
+  Push Service (you deploy, you control, has your credentials)
+       │
+       │  Periodic push: POST /hooks/push
+       │  (hooks token auth)
+       │
+       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │                    OpenClaw Gateway                   │
+  │                                                      │
+  │  push_entries (SQLite)     memory/push/*.md (files)  │
+  │  ┌─────────────────┐      ┌──────────────────────┐  │
+  │  │ structured JSON  │      │ searchable text      │  │
+  │  │ + refresh URLs   │      │ (auto-generated)     │  │
+  │  │ + enrichment     │      │ indexed by memory    │  │
+  │  │ + staleness      │      │ search pipeline      │  │
+  │  └────────┬────────┘      └──────────┬───────────┘  │
+  │           │                          │               │
+  │           └──────────┬───────────────┘               │
+  │                      ▼                               │
+  │           ┌─────────────────────┐                    │
+  │           │    Agent Runtime     │                    │
+  │           │                     │                    │
+  │           │ Tier 0: push_lookup │ → read local data  │
+  │           │ Tier 1: web_fetch   │ → public URLs      │
+  │           │ Tier 2: surface URL │ → user clicks      │
+  │           └─────────────────────┘                    │
+  └──────────────────────────────────────────────────────┘
 ```
 
-## Key Design Decision: Public Enrichment
+## Push Entry Structure
 
-Pushed entries can include `enrichment` metadata — public URLs or API patterns the bot
-can use to refresh live data without needing credentials:
+Every push entry has three sections: **data** (structured fields), **access** (how the
+bot and user can get fresh info), and **metadata** (TTL, staleness, tags).
 
 ```json
 {
   "source": "flights",
   "key": "DL1234-2026-02-19",
   "schema_type": "flight",
+  "category": "travel",
+
   "data": {
     "airline": "Delta",
     "flightNumber": "DL1234",
-    "departure": { "airport": "SFO", "time": "2026-02-19T08:00:00-08:00" },
-    "arrival": { "airport": "JFK" },
+    "departure": {
+      "airport": "SFO",
+      "terminal": "2",
+      "gate": "B34",
+      "time": "2026-02-19T08:00:00-08:00"
+    },
+    "arrival": {
+      "airport": "JFK",
+      "terminal": "4",
+      "time": "2026-02-19T16:30:00-05:00"
+    },
     "confirmationCode": "ABC123",
-    "seat": "12A"
+    "seat": "12A",
+    "status": "scheduled"
   },
-  "enrichment": {
-    "urls": [
+
+  "access": {
+    "public": [
       {
         "label": "Live flight status",
         "url": "https://flightaware.com/live/flight/DAL1234",
-        "hint": "Check this for current gate, delays, and arrival time"
+        "hint": "Check for current gate, delays, and arrival time"
       }
     ],
-    "refresh_hint": "Check status within 4 hours of departure"
-  }
+    "refresh": {
+      "url_template": "https://my-flights.example.com/refresh/{key}",
+      "label": "Refresh from Delta",
+      "hint": "Updates seat, gate, confirmation, and booking details"
+    }
+  },
+
+  "staleness": {
+    "stale_after_seconds": 86400,
+    "refresh_hint": "Your flight data is {age} old. Refresh from Delta?"
+  },
+
+  "tags": ["travel", "delta"],
+  "ttl": 259200,
+  "priority": "normal"
 }
 ```
 
-When the bot needs current flight status, it uses its existing `web_fetch` tool with the
-enrichment URL. The pusher provides the URL; the bot does the fetching. No credentials
-needed — FlightAware/FlightStats pages are public.
+### `access.public` — Tier 1
 
-**What stays private** (only in pushed data): confirmation code, seat, booking reference
-**What the bot can refresh** (via public URLs): flight status, gate, delays, terminal
+URLs the bot can freely `web_fetch` with no approval. These are public pages that
+don't require authentication.
+
+### `access.refresh` — Tier 2
+
+A URL template the bot surfaces to the user when data is stale. The `{key}` and
+`{source}` placeholders get filled in. The user clicks the link, approves on the push
+service, and the push service sends a fresh push.
+
+The `url_template` can also be a full URL without placeholders — it's just a string
+the bot presents to the user.
+
+### `staleness` — When to offer refresh
+
+- `stale_after_seconds`: After this many seconds since `updated_at`, the bot considers
+  the data potentially outdated for volatile fields (seat, gate, status)
+- `refresh_hint`: Template for what the bot says when offering a refresh link.
+  `{age}` is replaced with human-readable age ("3 days", "2 hours")
+- Factual data that doesn't change (confirmation code, flight number) is always
+  served from Tier 0 regardless of staleness
 
 ## Storage
 
 ### SQLite Table (`push_entries`)
 
-Stored in the agent's existing memory database (alongside embeddings).
+In the agent's memory database.
 
 ```sql
 CREATE TABLE push_entries (
@@ -111,15 +194,17 @@ CREATE TABLE push_entries (
   key TEXT NOT NULL,
   category TEXT,
   schema_type TEXT NOT NULL,
-  data TEXT NOT NULL,             -- structured JSON
-  enrichment TEXT,                -- enrichment config JSON
-  tags TEXT,                      -- JSON array of strings
+  data TEXT NOT NULL,               -- structured JSON (the real payload)
+  access TEXT,                      -- JSON: { public: [...], refresh: {...} }
+  staleness TEXT,                   -- JSON: { stale_after_seconds, refresh_hint }
+  tags TEXT,                        -- JSON array of strings
   priority TEXT DEFAULT 'normal',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  expires_at INTEGER,             -- unix ms, NULL = never
+  created_at INTEGER NOT NULL,      -- unix ms
+  updated_at INTEGER NOT NULL,      -- unix ms
+  expires_at INTEGER,               -- unix ms, NULL = never
   UNIQUE(source, key)
 );
+
 CREATE INDEX idx_push_source ON push_entries(source);
 CREATE INDEX idx_push_category ON push_entries(category);
 CREATE INDEX idx_push_schema ON push_entries(schema_type);
@@ -128,35 +213,30 @@ CREATE INDEX idx_push_expires ON push_entries(expires_at);
 
 ### Memory Files
 
-Each push entry also produces a managed markdown file at:
-`~/.openclaw/memory/push/{source}/{key}.md`
+Auto-generated at `~/.openclaw/memory/push/{source}/{key}.md` for the existing
+memory search pipeline to index.
 
-This is what gets indexed by the existing memory sync pipeline. The file is auto-generated
-from structured data — never hand-edited.
-
-Example (`~/.openclaw/memory/push/flights/DL1234-2026-02-19.md`):
+Example:
 
 ```markdown
----
-source: flights
-key: DL1234-2026-02-19
-schema_type: flight
-category: travel
-expires_at: 2026-02-22T08:00:00Z
----
 # Flight: Delta DL1234
 
 - **Route**: SFO → JFK
-- **Departure**: Feb 19, 2026 8:00 AM PST
-- **Arrival**: Feb 19, 2026 4:30 PM EST
+- **Departure**: Feb 19, 2026 8:00 AM PST (Terminal 2, Gate B34)
+- **Arrival**: Feb 19, 2026 4:30 PM EST (Terminal 4)
 - **Confirmation**: ABC123
 - **Seat**: 12A
 - **Status**: Scheduled
 
-> To check live status: https://flightaware.com/live/flight/DAL1234
+Live status: https://flightaware.com/live/flight/DAL1234
 ```
 
+No frontmatter needed — the structured data lives in SQLite. The markdown file exists
+purely to make push data discoverable via `memory_search`.
+
 ## Schema Types
+
+Built-in types with known fields. Unknown types accepted as `generic`.
 
 ### `flight`
 
@@ -168,7 +248,7 @@ type FlightData = {
     airport: string;
     terminal?: string;
     gate?: string;
-    time: string; // ISO 8601
+    time: string;           // ISO 8601
   };
   arrival: {
     airport: string;
@@ -189,10 +269,10 @@ type FlightData = {
 ```typescript
 type HotelData = {
   name: string;
-  brand?: string; // "Hilton", "Marriott", etc.
+  brand?: string;           // "Hilton", "Marriott"
   address?: string;
   city?: string;
-  checkIn: string;  // ISO date or datetime
+  checkIn: string;          // ISO date or datetime
   checkOut: string;
   confirmationCode?: string;
   roomType?: string;
@@ -207,30 +287,16 @@ type HotelData = {
 
 ```typescript
 type PackageTrackingData = {
-  carrier: string;        // "FedEx", "UPS", "USPS", "DHL"
+  carrier: string;           // "FedEx", "UPS", "USPS", "DHL"
   trackingNumber: string;
-  description?: string;   // "MacBook Pro 16-inch"
+  description?: string;      // "MacBook Pro 16-inch"
+  sender?: string;
   origin?: string;
   destination?: string;
   status?: "pre_transit" | "in_transit" | "out_for_delivery" | "delivered" | "exception";
   estimatedDelivery?: string;
   lastUpdate?: string;
   lastLocation?: string;
-};
-```
-
-### `calendar_event`
-
-```typescript
-type CalendarEventData = {
-  title: string;
-  startTime: string;
-  endTime?: string;
-  location?: string;
-  description?: string;
-  attendees?: string[];
-  conferenceUrl?: string;
-  recurring?: boolean;
 };
 ```
 
@@ -244,82 +310,64 @@ type GenericData = {
 };
 ```
 
-Unknown schema types are accepted and treated like `generic` — the system is open, not
-closed. New types can be added without breaking anything.
+## Agent Tool: `memory_push_lookup`
 
-## Enrichment Config
-
-Every push entry can optionally include enrichment metadata:
+Returns structured JSON with staleness and access info so the bot can make the right
+decision about which tier to use.
 
 ```typescript
-type PushEnrichment = {
-  urls?: Array<{
-    label: string;         // "Live flight status"
-    url: string;           // Public URL the bot can fetch
-    hint?: string;         // When/how to use this URL
-  }>;
-  refresh_hint?: string;   // Human-readable guidance for the bot
-};
+memory_push_lookup({
+  source?: string,
+  category?: string,
+  schema_type?: string,
+  key?: string,
+  active?: boolean,       // only non-expired (default true)
+})
 ```
 
-The bot's existing `web_fetch` tool handles the actual fetching. The push system just
-stores the URLs alongside the data so the bot knows *where* to look for updates.
-
-## Webhooks (Two-Way)
-
-Push entries can register outbound webhook notifications:
-
-```typescript
-type PushWebhook = {
-  url: string;             // URL to POST to
-  events: Array<
-    "expiring" |           // Entry expires within `before` period
-    "expired" |            // Entry has expired and been reaped
-    "updated" |            // Entry was updated by a subsequent push
-    "deleted"              // Entry was explicitly deleted
-  >;
-  before?: number;         // Seconds before expiry to fire "expiring" (default: 3600)
-  headers?: Record<string, string>;  // Custom headers for the webhook
-};
-```
-
-Example: A flight pusher registers a webhook so it knows to refresh the push when data
-is about to expire:
+Response includes staleness metadata so the bot reasons correctly:
 
 ```json
 {
-  "source": "flights",
-  "key": "DL1234-2026-02-19",
-  "schema_type": "flight",
-  "data": { "..." : "..." },
-  "webhooks": [{
-    "url": "https://my-flight-pusher.example.com/refresh",
-    "events": ["expiring"],
-    "before": 7200
-  }]
+  "entries": [{
+    "source": "flights",
+    "key": "DL1234-2026-02-19",
+    "schema_type": "flight",
+    "data": { ... },
+    "access": {
+      "public": [{ "label": "Live status", "url": "https://flightaware.com/..." }],
+      "refresh": {
+        "url": "https://my-flights.example.com/refresh/DL1234-2026-02-19",
+        "label": "Refresh from Delta"
+      }
+    },
+    "age_seconds": 259200,
+    "is_stale": true,
+    "refresh_hint": "Your flight data is 3 days old. Refresh from Delta?",
+    "expires_at": "2026-02-22T08:00:00.000Z"
+  }],
+  "total": 1
 }
 ```
 
-Webhook payloads:
+Tool description for the agent:
 
-```json
-{
-  "event": "expiring",
-  "source": "flights",
-  "key": "DL1234-2026-02-19",
-  "schema_type": "flight",
-  "expires_at": "2026-02-22T08:00:00.000Z",
-  "expires_in_seconds": 7200
-}
-```
+> Look up structured data pushed by external services (flights, hotels, packages).
+> Returns typed fields you can read directly (e.g. `data.departure.gate`).
+>
+> **Tier 0** (always safe): Read any field from the returned data.
+> **Tier 1** (public, free): Use `access.public` URLs with `web_fetch` for live status.
+> **Tier 2** (user approval): If `is_stale` is true and `access.refresh` exists,
+> present the refresh URL to the user so they can approve a data refresh.
+> Never call the refresh URL yourself.
 
 ## API Endpoints
 
-All under the existing hooks HTTP infrastructure, using the same auth token.
+All under `/hooks/push`, using the existing hooks auth token.
 
-### `POST /hooks/push`
+### `POST /hooks/push` — Push entries
 
-Push one or more entries. Upserts on `(source, key)`.
+Upserts on `(source, key)`. The push service calls this periodically.
 
 ```json
 {
@@ -329,11 +377,10 @@ Push one or more entries. Upserts on `(source, key)`.
     "schema_type": "flight",
     "category": "travel",
     "data": { ... },
-    "enrichment": { ... },
-    "webhooks": [{ ... }],
-    "tags": ["travel", "delta"],
-    "ttl": 259200,
-    "priority": "normal"
+    "access": { ... },
+    "staleness": { ... },
+    "tags": ["travel"],
+    "ttl": 259200
   }]
 }
 ```
@@ -344,175 +391,112 @@ Response:
   "ok": true,
   "accepted": 1,
   "results": [{
-    "id": "uuid",
+    "id": "...",
     "source": "flights",
     "key": "DL1234-2026-02-19",
-    "status": "created"
+    "status": "created" | "updated"
   }]
 }
 ```
 
-### `DELETE /hooks/push/{source}/{key}`
+### `DELETE /hooks/push/{source}/{key}` — Remove entry
 
-Remove a specific entry. Deletes the DB row, removes the memory file, fires webhooks.
+### `GET /hooks/push` — List entries
 
-### `GET /hooks/push`
+Query: `?source=flights&category=travel&active=true`
 
-List entries. Query params: `?source=flights&category=travel&active=true`
-
-### `GET /hooks/push/{source}/{key}`
-
-Get a specific entry with full structured data.
-
-## Agent Tool: `memory_push_lookup`
-
-A new tool registered alongside `memory_search` and `memory_get`:
-
-```typescript
-memory_push_lookup({
-  source?: string,       // filter by source
-  category?: string,     // filter by category
-  schema_type?: string,  // filter by schema type
-  key?: string,          // exact key lookup
-  active?: boolean,      // only non-expired (default true)
-})
-```
-
-Returns structured JSON — not text snippets. The bot gets real fields it can reason about:
-
-```json
-{
-  "entries": [{
-    "source": "flights",
-    "key": "DL1234-2026-02-19",
-    "schema_type": "flight",
-    "data": {
-      "airline": "Delta",
-      "flightNumber": "DL1234",
-      "departure": { "airport": "SFO", "time": "2026-02-19T08:00:00-08:00" },
-      "arrival": { "airport": "JFK" },
-      "confirmationCode": "ABC123",
-      "seat": "12A"
-    },
-    "enrichment": {
-      "urls": [{ "label": "Live status", "url": "https://flightaware.com/..." }]
-    },
-    "expires_at": "2026-02-22T08:00:00.000Z"
-  }],
-  "total": 1
-}
-```
-
-Tool description emphasizes: "For live/current status, use the enrichment URLs with
-web_fetch after looking up the entry."
+### `GET /hooks/push/{source}/{key}` — Get specific entry
 
 ## TTL Reaper
 
-A periodic job running on a configurable interval (default: every 15 minutes):
+Runs on a configurable interval (default: 15 minutes):
 
-1. Find entries where `expires_at < now()`
-2. Fire "expired" webhooks for entries that haven't already been notified
-3. Find entries where `expires_at < now() + before` (for "expiring" webhooks)
-4. Fire "expiring" webhooks
-5. Delete expired entries from DB
-6. Delete corresponding memory files from `~/.openclaw/memory/push/`
-7. Next memory sync cycle cleans up stale index entries
+1. Query entries where `expires_at IS NOT NULL AND expires_at < now()`
+2. Delete expired rows from SQLite
+3. Delete corresponding memory files
+4. Memory sync pipeline cleans up stale index entries on next cycle
+
+Simple. No webhook complexity — the push service knows its own TTLs.
 
 ## Configuration
 
-Added to `memory` in `openclaw.json`:
+In `openclaw.json` under `memory`:
 
 ```jsonc
 {
   "memory": {
-    // existing fields...
     "push": {
       "enabled": true,
       "allowedSources": [],           // empty = allow all
       "maxEntries": 1000,
       "maxEntryBytes": 102400,        // 100KB per entry
       "defaultTtlSeconds": 2592000,   // 30 days
-      "reapIntervalMinutes": 15,
-      "webhooks": {
-        "enabled": true,
-        "timeoutMs": 10000,
-        "maxRetries": 2
-      }
+      "reapIntervalMinutes": 15
     }
   }
 }
 ```
 
-## Security Model
+## Implementation Files
 
-- Bot never gets external credentials — pushers run independently
-- Hooks token required for all push API calls (reuses existing hooks auth)
-- Source allowlisting — optionally restrict which source names are accepted
-- Size limits — per-entry and global caps
-- TTL enforcement — data doesn't accumulate indefinitely
-- No code execution — pushed data is passive, never evaluated
-- Enrichment URLs are fetched by the bot's `web_fetch` tool, which already has SSRF
-  protections and domain filtering
-
-## Implementation Order
-
-### Phase 1: Core Storage + API
+### Phase 1: Core
 
 | # | File | What |
 |---|------|------|
 | 1 | `src/config/types.memory.ts` | Add `MemoryPushConfig` type |
-| 2 | `src/config/types.openclaw.ts` | No change needed — `MemoryConfig` already imported |
-| 3 | `src/memory/push/schema.ts` | Zod schemas for push API, known schema types, enrichment |
-| 4 | `src/memory/push/store.ts` | SQLite CRUD for `push_entries` |
-| 5 | `src/memory/push/content-gen.ts` | Structured data → markdown file content |
-| 6 | `src/memory/push/file-sync.ts` | Write/delete managed markdown files |
-| 7 | `src/memory/push/reaper.ts` | TTL expiry + "expiring"/"expired" webhook dispatch |
-| 8 | `src/memory/push/webhooks.ts` | Outbound webhook delivery |
+| 2 | `src/memory/push/schema.ts` | Zod schemas: push API, schema types, access, staleness |
+| 3 | `src/memory/push/store.ts` | SQLite CRUD for `push_entries` |
+| 4 | `src/memory/push/content-gen.ts` | Structured data → markdown text |
+| 5 | `src/memory/push/file-sync.ts` | Write/delete managed memory files |
+| 6 | `src/memory/push/reaper.ts` | TTL expiry cleanup |
 
-### Phase 2: HTTP + Agent Integration
+### Phase 2: HTTP + Agent
 
 | # | File | What |
 |---|------|------|
-| 9 | `src/gateway/push-memory-http.ts` | HTTP handlers for `/hooks/push` endpoints |
-| 10 | `src/gateway/server-http.ts` | Register push handler in dispatch chain |
-| 11 | `src/agents/tools/push-lookup-tool.ts` | `memory_push_lookup` agent tool |
-| 12 | `src/memory/internal.ts` | Add push dir to `listMemoryFiles()` discovery |
+| 7 | `src/gateway/push-memory-http.ts` | HTTP handlers for `/hooks/push` |
+| 8 | `src/gateway/server-http.ts` | Register push handler in dispatch chain |
+| 9 | `src/agents/tools/push-lookup-tool.ts` | `memory_push_lookup` agent tool |
+| 10 | `src/memory/internal.ts` | Add push dir to memory file discovery |
 
-### Phase 3: Tool Registration + Wiring
+### Phase 3: Registration
 
 | # | File | What |
 |---|------|------|
-| 13 | `extensions/memory-core/index.ts` | Register push lookup tool alongside memory tools |
-| 14 | `src/plugins/runtime/index.ts` | Expose push store to plugin runtime |
+| 11 | `extensions/memory-core/index.ts` | Register push lookup tool |
+| 12 | `src/plugins/runtime/index.ts` | Expose to plugin runtime |
 
-## User Flow Example
+## Example Flow
 
 ```
-1. You deploy a flight pusher daemon:
-   $ openclaw-push flights \
-       --gateway http://localhost:18789 \
-       --token $HOOKS_TOKEN \
-       --delta-email you@gmail.com
+1. You deploy your flight push service:
+   - It has your Delta credentials
+   - It runs as a cron, pushes flight data every 6 hours
+   - It has a web UI at my-flights.example.com with a "refresh now" button
 
-2. Pusher detects a new flight email, pushes structured data:
-   POST /hooks/push
-   { entries: [{ source: "flights", key: "DL1234-2026-02-19", ... }] }
+2. Push service pushes structured data:
+   POST /hooks/push { entries: [{ source: "flights", key: "DL1234-...", ... }] }
 
-3. Bot now has the flight in memory. Later, in conversation:
-
-   You: "When does my flight leave tomorrow?"
-   Bot: [uses memory_push_lookup, reads data.departure.time]
-   Bot: "Your Delta DL1234 departs SFO at 8:00 AM PST."
-
-   You: "Is it on time?"
-   Bot: [reads enrichment.urls, uses web_fetch on FlightAware URL]
-   Bot: "Checking live status... Yes, DL1234 is on time. Gate B34."
-
+3. Conversation — Tier 0 (cached):
    You: "What's my confirmation code?"
-   Bot: [reads data.confirmationCode from push entry]
-   Bot: "Your confirmation code is ABC123."
+   Bot: [memory_push_lookup → data.confirmationCode]
+   Bot: "Your confirmation is ABC123."
+
+4. Conversation — Tier 1 (public):
+   You: "Is my flight on time?"
+   Bot: [memory_push_lookup → access.public[0].url]
+   Bot: [web_fetch on FlightAware]
+   Bot: "DL1234 is on time, departing Gate B34."
+
+5. Conversation — Tier 2 (refresh):
+   You: "Did my seat change?"
+   Bot: [memory_push_lookup → is_stale: true, 3 days old]
+   Bot: "Your last pushed data shows seat 12A, but it's 3 days old."
+   Bot: "Refresh from Delta → https://my-flights.example.com/refresh/DL1234-2026-02-19"
+   User: *clicks link, approves on push service*
+   Push service: *fetches from Delta, pushes fresh data*
+   Bot: "Got the update — still seat 12A, no changes."
 ```
 
-The private data (confirmation code) came from the push.
-The live data (gate, on-time status) came from a public URL.
-The bot never touched your Delta account.
+**The bot never touched Delta. The bot never called your push service.
+The bot just knew what to read locally, what to fetch publicly, and when to hand you a link.**
