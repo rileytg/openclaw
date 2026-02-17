@@ -1,0 +1,348 @@
+                         OPENCLAW INTEGRATION
+                         ═══════════════════
+
+The quarantine is a separate Go binary. It never links to, imports from,
+or runs inside the openclaw Node.js process. This document describes the
+two systems' shared surfaces and how to wire them together.
+
+
+1. PROCESS TOPOLOGY
+───────────────────
+
+    ┌─────────────────────────────────────────────┐
+    │  openclaw gateway  (Node.js, :18789)        │
+    │                                             │
+    │  hooks endpoint  ──→  agents / sessions     │
+    │  /hooks/agent         ~/.openclaw/agents/   │
+    │  /hooks/wake          ~/.openclaw/workspace/ │
+    └────────────────────────┬────────────────────┘
+                             │
+                 webhook POST (push token)
+                             │
+    ┌────────────────────────▼────────────────────┐
+    │  quarantine  (Go, :8033)                    │
+    │                                             │
+    │  POST /push        ──→  sqlite (pending)    │
+    │  GET  /items       ──→  admin review        │
+    │  POST /promote     ──→  write to workspace  │
+    └────────────────────────┬────────────────────┘
+                             │
+                   promote (filesystem write)
+                             │
+                             ▼
+                  ~/.openclaw/workspace/
+                  (or agent-specific dir)
+
+
+The quarantine only touches the bot's filesystem through the promote
+command — and only for items an admin has explicitly approved.
+
+
+2. HOW OPENCLAW PUSHES TO QUARANTINE
+─────────────────────────────────────
+
+Openclaw's hook system is the integration point. A hook transform
+intercepts incoming webhook payloads and forwards content to the
+quarantine HTTP API before (or instead of) letting the agent process it.
+
+
+2a. Hook mapping (openclaw.json)
+
+    {
+      "hooks": {
+        "enabled": true,
+        "token": "gateway-secret",
+        "mappings": [
+          {
+            "id": "quarantine-push",
+            "match": { "path": "memory" },
+            "action": "agent",
+            "sessionKey": "hook:quarantine",
+            "messageTemplate": "Queued to quarantine: {{label}}",
+            "transform": {
+              "module": "quarantine-push.mjs"
+            }
+          }
+        ]
+      }
+    }
+
+The mapping matches POST /hooks/memory requests and routes them through
+a transform module before dispatching to the agent.
+
+
+2b. Transform module (~/.openclaw/hooks/transforms/quarantine-push.mjs)
+
+    const QUARANTINE_URL = process.env.QUARANTINE_URL || "http://127.0.0.1:8033";
+    const QUARANTINE_PUSH_TOKEN = process.env.QUARANTINE_PUSH_TOKEN;
+
+    export async function transform(ctx) {
+      const { payload } = ctx;
+
+      const res = await fetch(`${QUARANTINE_URL}/push`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${QUARANTINE_PUSH_TOKEN}`,
+        },
+        body: JSON.stringify({
+          kind:       payload.kind       || "memory",
+          content:    payload.content     || payload.text || "",
+          label:      payload.label       || "",
+          targetPath: payload.targetPath  || "",
+          metadata:   {
+            source:     payload.source,
+            channel:    ctx.headers["x-hook-channel"],
+            hookPath:   ctx.path,
+          },
+        }),
+      });
+
+      const result = await res.json();
+
+      if (!result.ok) {
+        // Return null to skip — don't let the agent see rejected pushes.
+        return null;
+      }
+
+      // Let the agent know something was queued (optional).
+      return {
+        message: `Quarantined item ${result.id} (${payload.kind}). Pending review.`,
+      };
+    }
+
+Returning null from a transform skips the hook entirely (no agent turn).
+Returning { message: "..." } overrides what the agent sees.
+
+
+2c. Direct push from external systems
+
+Any system with the push token can POST directly:
+
+    curl -X POST http://127.0.0.1:8033/push \
+      -H "Authorization: Bearer $QUARANTINE_PUSH_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "kind": "memory",
+        "content": "Riley prefers dark mode.",
+        "label": "user-preference",
+        "targetPath": "memory/preferences.md"
+      }'
+
+The quarantine doesn't care where the push comes from — a hook
+transform, a GitHub Actions workflow, a cron job, or a human with curl.
+
+
+3. WORKSPACE PATHS
+──────────────────
+
+Openclaw resolves agent workspaces as follows:
+
+    Default agent workspace:
+      ~/.openclaw/workspace/           (or $OPENCLAW_STATE_DIR/workspace/)
+
+    Named agent workspace:
+      ~/.openclaw/workspace-{agentId}/ (unless overridden per-agent)
+
+    Per-agent override:
+      agents.list[].workspace in openclaw.json
+
+    Agent data directory (sessions, memory.db):
+      ~/.openclaw/agents/{agentId}/
+
+Set QUARANTINE_BOT_WORKSPACE to match the agent workspace you want
+promoted content to land in. Typical values:
+
+    # Default agent
+    QUARANTINE_BOT_WORKSPACE=~/.openclaw/workspace
+
+    # Named agent "research"
+    QUARANTINE_BOT_WORKSPACE=~/.openclaw/workspace-research
+
+The quarantine's promote command resolves targetPath relative to this
+directory and rejects any path that escapes it (no ../ traversal).
+
+
+4. PROMOTE TARGETS
+──────────────────
+
+When a pusher submits an item, they set targetPath to indicate where
+the content should land inside the workspace. Examples:
+
+    targetPath              Resolves to
+    ──────────              ───────────
+    memory/facts.md         ~/.openclaw/workspace/memory/facts.md
+    notes/2024-02-17.md     ~/.openclaw/workspace/notes/2024-02-17.md
+    context.md              ~/.openclaw/workspace/context.md
+
+If the target file already exists, promote appends with a --- separator.
+This means memory files accumulate naturally.
+
+For "message" kind items, no file is written — the content is stored
+in the quarantine database for review only.
+
+
+5. AUTH TOKEN MODEL
+───────────────────
+
+There are three independent token scopes. None of these tokens overlap
+with openclaw's gateway token or hook token.
+
+    Token                     Who holds it         What it can do
+    ─────                     ────────────         ──────────────
+    QUARANTINE_PUSH_TOKEN     Hook transforms,     POST /push, GET /pending
+                              external scripts     (cannot read, review, or
+                                                    promote items)
+
+    QUARANTINE_ADMIN_TOKEN    Human operators,     All /items/* endpoints,
+                              admin scripts        POST /promote, POST /purge
+                                                   (full read/write)
+
+    hooks.token               Webhooks → gateway   POST /hooks/* on the
+    (openclaw.json)                                openclaw gateway
+                                                   (separate system)
+
+A compromised push token can only enqueue pending items. It cannot
+read existing items, approve anything, promote to the workspace, or
+access the openclaw gateway.
+
+
+6. DEPLOYMENT
+─────────────
+
+6a. Systemd (same host as openclaw)
+
+    [Unit]
+    Description=openclaw quarantine
+    After=network.target
+
+    [Service]
+    Type=simple
+    ExecStart=/usr/local/bin/quarantine serve
+    Environment=QUARANTINE_DB_PATH=/var/lib/openclaw-quarantine/q.db
+    Environment=QUARANTINE_PUSH_TOKEN=push-secret-here
+    Environment=QUARANTINE_ADMIN_TOKEN=admin-secret-here
+    Environment=QUARANTINE_BOT_WORKSPACE=/home/bot/.openclaw/workspace
+    Environment=QUARANTINE_LISTEN=127.0.0.1:8033
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+
+
+6b. Docker (isolated)
+
+    docker run -d \
+      -v /var/lib/openclaw-quarantine:/data \
+      -e QUARANTINE_DB_PATH=/data/q.db \
+      -e QUARANTINE_PUSH_TOKEN=push-secret-here \
+      -e QUARANTINE_ADMIN_TOKEN=admin-secret-here \
+      -e QUARANTINE_BOT_WORKSPACE=/workspace \
+      -v /home/bot/.openclaw/workspace:/workspace \
+      -p 127.0.0.1:8033:8033 \
+      quarantine serve
+
+Note: the workspace volume is the only shared surface between
+containers. The quarantine binary has no access to openclaw's
+config, sessions, or database.
+
+
+6c. Build
+
+    cd quarantine/
+    CGO_ENABLED=1 go build -o quarantine .
+
+
+7. LIFECYCLE
+────────────
+
+    External event
+         │
+         ▼
+    POST /hooks/memory (openclaw gateway, hook token)
+         │
+         ▼
+    Hook transform calls POST /push (quarantine, push token)
+         │
+         ▼
+    Item stored as "pending" in quarantine sqlite
+         │
+         ▼
+    Admin reviews:  quarantine list --status=pending
+                    quarantine inspect <id>
+                    quarantine approve <id>   ← or reject
+         │
+         ▼
+    Admin promotes: quarantine promote <id>
+         │
+         ▼
+    Content written to ~/.openclaw/workspace/<targetPath>
+         │
+         ▼
+    Bot's memory search picks it up on next agent turn
+    (memory manager indexes workspace files automatically)
+
+
+8. OPENCLAW MEMORY SEARCH
+──────────────────────────
+
+Openclaw's memory system (src/memory/manager.ts) indexes files in the
+agent's workspace directory. It uses SQLite with embeddings (OpenAI,
+Gemini, Voyage, or local) and full-text search.
+
+When a promoted file lands in the workspace, the memory manager will
+index it on the next sync. The agent then sees the content in its
+memory search results — as if the file had always been there.
+
+No special configuration is needed. The memory manager watches the
+workspace directory by default.
+
+If you want promoted content to land in a specific subdirectory that
+the memory manager indexes, use targetPath values like:
+
+    memory/facts.md          General knowledge
+    memory/preferences.md    User preferences
+    notes/context.md         Contextual notes
+
+
+9. INTERNAL HOOKS (ALTERNATIVE)
+───────────────────────────────
+
+Instead of (or in addition to) a webhook transform, openclaw's internal
+hook system can push to quarantine on agent events:
+
+    {
+      "hooks": {
+        "internal": {
+          "enabled": true,
+          "handlers": [
+            {
+              "event": "command:new",
+              "module": "quarantine-on-command.mjs"
+            }
+          ]
+        }
+      }
+    }
+
+Internal hooks fire on events like command:new, session:start, and
+agent:bootstrap. The handler module receives an InternalHookEvent with
+type, action, sessionKey, context, and a messages array.
+
+This is useful for intercepting agent-generated content before it
+reaches the session store — but hook transforms (section 2) are the
+simpler integration point for external pushers.
+
+
+10. WHAT THE QUARANTINE DOES NOT DO
+────────────────────────────────────
+
+- Does not read openclaw.json or any bot config
+- Does not connect to the openclaw gateway
+- Does not access agent sessions, transcripts, or memory.db
+- Does not modify the bot's SQLite databases
+- Does not run any agent turns or LLM calls
+- Does not send messages to any channel
+- Does not have network access beyond its own HTTP listener
+- Cannot promote items that haven't been explicitly approved
+- Cannot write outside QUARANTINE_BOT_WORKSPACE
